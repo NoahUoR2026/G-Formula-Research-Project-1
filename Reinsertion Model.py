@@ -1,9 +1,11 @@
-"""
+'''
 REINSERTION PROBABILITY MODEL + G-FORMULA SIMULATION
 (Day + Stability + Hybrid + CAUTI-RISK-THRESHOLD policies)
+'''
+# Predicts reinsertion_in_period - does the catheter go back in after
+# removal. Risk period starts AFTER removal, opposite of the CAUTI
 
 
-"""
 
 # Import Libraries
 import pandas as pd
@@ -21,8 +23,13 @@ from sklearn.calibration import calibration_curve, CalibratedClassifierCV
 # PART 1 - BUILD THE REINSERTION PROBABILITY MODEL
 # ==============================================================================
 
+# Target only makes sense on rows where at_risk_reinsertion == 1
+# (catheter currently out, patient could still get one reinserted)
 TARGET = "reinsertion_in_period"
 
+# Predictor list - no periods_in_state or interval_hours here, since
+# those get recomputed per-policy under the counterfactual timeline
+# later (see periods_in_state_cf), rather than being fixed columns
 PREDICTORS = [
     "age",
     "sex_M",
@@ -59,6 +66,8 @@ PREDICTORS = [
     "itemid_220050__mean",
 ]
 
+# IDs and flags I need on top of the predictors - to define risk sets,
+# split train/test, and identify episodes later
 EXTRA_COLS = [
     "subject_id",
     "hadm_id",
@@ -80,20 +89,24 @@ print("Loading data...")
 df_full = pd.read_csv("Dataset.csv", usecols=all_columns_needed)
 print("Data loaded. Shape:", df_full.shape)
 
+# Sanity check before doing anything else 
 missing_cols = [c for c in all_columns_needed if c not in df_full.columns]
 if len(missing_cols) > 0:
     raise ValueError("These columns are missing from the dataset:", missing_cols)
 print("All expected columns are present.")
 
+# Always sort into chronological order per episode
 df_full = df_full.sort_values(
     ["subject_id", "episode_index", "periods_in_state"]
 ).reset_index(drop=True)
 print("Data sorted into time order per patient.")
 
+# Restrict to at-risk rows for TRAINING only 
 df_model = df_full[df_full["at_risk_reinsertion"] == 1].copy()
 print("Rows used for model training (at risk only):", len(df_model))
 print("Rows kept aside for g-formula simulation (all rows):", len(df_full))
 
+# Use the predefined split column
 df_train = df_model[df_model["split"] == "train"].copy()
 df_test = df_model[df_model["split"] == "test"].copy()
 print("Training rows:", len(df_train))
@@ -104,17 +117,21 @@ y_train = df_train[TARGET]
 X_test = df_test[PREDICTORS]
 y_test = df_test[TARGET]
 
+# Group by subject for GroupKFold
 groups = df_train["subject_id"]
 
 baseline_rate = y_test.mean()
 print("\nbaseline rate:", round(baseline_rate, 4))
 
+# Median imputation, fit on train only
 imputer = SimpleImputer(strategy="median")
 X_train = pd.DataFrame(imputer.fit_transform(X_train), columns=PREDICTORS)
 X_test = pd.DataFrame(imputer.transform(X_test), columns=PREDICTORS)
 
+# Save the imputer 
 joblib.dump(imputer, "imputer_reinsertion.pkl")
 
+# Gradient Boosting Classifier
 model = GradientBoostingClassifier(
     n_estimators=300,
     learning_rate=0.03,
@@ -126,6 +143,7 @@ model = GradientBoostingClassifier(
 pipeline = Pipeline([("imputer", SimpleImputer(strategy="median")), ("model", model)])
 group_kfold = GroupKFold(n_splits=5)
 
+# Cross-validate with all 3 metrics
 cv_results = cross_validate(
     pipeline, X_train, y_train, cv=group_kfold, groups=groups,
     scoring=["roc_auc", "average_precision", "neg_brier_score"]
@@ -135,10 +153,12 @@ print("ROC-AUC:", round(cv_results["test_roc_auc"].mean(), 4))
 print("AUPRC:  ", round(cv_results["test_average_precision"].mean(), 4))
 print("Brier:  ", round((-cv_results["test_neg_brier_score"]).mean(), 4))
 
+# Refit on the full training set with isotonic calibration
 calibrated_model = CalibratedClassifierCV(estimator=pipeline, method="isotonic", cv=5)
 calibrated_model.fit(X_train, y_train)
 joblib.dump(calibrated_model, "model_reinsertion.pkl")
 
+# Final check on the held-out test set
 y_prob = calibrated_model.predict_proba(X_test)[:, 1]
 roc_auc = roc_auc_score(y_test, y_prob)
 auprc = average_precision_score(y_test, y_prob)
@@ -155,11 +175,6 @@ print("Brier:  ", round(brier, 4))
 # ==============================================================================
 # PART 1b - LOAD THE CAUTI MODEL (drives the risk-threshold removal decision)
 # ==============================================================================
-#
-# The removal decision is driven by predicted CAUTI risk, not reinsertion
-# risk — CAUTI risk is defined while the catheter is still in place, which
-# is exactly when the removal decision needs to be made. Assumes
-# model_cauti.pkl / imputer_cauti.pkl already exist from your CAUTI script.
 
 CAUTI_PREDICTORS = [
     "age",
@@ -207,6 +222,7 @@ cauti_model = joblib.load("model_cauti.pkl")
 # PART 2 - BUILD G FORMULA DATASET AND COUNTERFACTUAL TRAJECTORIES
 # ==============================================================================
 
+# Simulation dataset, test split, sorted chronologically 
 df_sim = df_full[df_full["split"] == "test"].copy()
 df_sim = df_sim.sort_values(
     ["subject_id", "episode_index", "periods_in_state"]
@@ -219,22 +235,19 @@ print("Patients:", df_sim["subject_id"].nunique())
 df_sim_atrisk = df_sim[df_sim["at_risk_reinsertion"] == 1].copy()
 print("At-risk rows available for policy simulation:", len(df_sim_atrisk))
 
+# group by the full episode key
 EPISODE_KEY = ["subject_id", "hadm_id", "stay_id", "episode_index"]
 TIME_KEY = "interval_hours"
 
+# Swap periods_in_state for periods_in_state_cf in the column list
 PREDICTORS_CF = [
     "periods_in_state_cf" if col == "periods_in_state" else col
     for col in PREDICTORS
 ]
 
-# ------------------------------------------------------------------
-# Precompute predicted CAUTI probability for every row where the
-# catheter is still in place (at_risk_cauti == 1), ONCE, globally.
-# This is the REAL predicted CAUTI risk at that observed moment — not a
-# hypothetical — since it reflects the patient's actual current clinical
-# state while still catheterized, which is exactly when the removal
-# decision needs to be made.
-# ------------------------------------------------------------------
+
+# Precompute predicted CAUTI probability for every row 
+
 cauti_scored_mask = df_sim["at_risk_cauti"] == 1
 X_cauti = pd.DataFrame(
     cauti_imputer.transform(df_sim.loc[cauti_scored_mask, CAUTI_PREDICTORS]),
@@ -261,6 +274,7 @@ STABILITY_THRESHOLDS = {
     "o2sat_min": 94.0,
 }
 
+# All the policies being compared.
 POLICIES = {
     "Observed Practice": {"type": "natural"},
 
@@ -290,22 +304,13 @@ POLICIES = {
 
 
 def create_counterfactual_patient(episode_rows, policy):
-    """
-    Decide removed_in_period for one episode under a given policy.
-    "day": force removal once periods_in_state reaches the threshold.
-    "stability": remove at first period all 4 vitals meet criteria.
-    "stability_min_day": stability AND a minimum elapsed day.
-    "hybrid": remove at whichever of (stability, day cap) comes first.
-    "cauti_risk_threshold": remove at first period predicted CAUTI risk
-        reaches the threshold. No model call here — predicted_cauti_risk
-        was already computed once, globally, above, so this is pure
-        bookkeeping, exactly like every other policy type.
-    """
+    # Sort by time and reset the removal flag
     patient_cf = episode_rows.sort_values(TIME_KEY).copy()
     ptype = policy["type"]
 
     patient_cf["removed_in_period"] = 0
 
+    # Observed practice just uses the real recorded data as-is
     if ptype == "natural":
         patient_cf["reinsertion_state_cf"] = np.where(
             patient_cf["at_risk_reinsertion"] == 1, "AT_RISK", "NOT_AT_RISK"
@@ -313,6 +318,7 @@ def create_counterfactual_patient(episode_rows, policy):
         patient_cf["periods_in_state_cf"] = patient_cf["periods_in_state"]
         return patient_cf
 
+    # Loop through each period in time order 
     removed = False
 
     for idx in patient_cf.index:
@@ -334,6 +340,8 @@ def create_counterfactual_patient(episode_rows, policy):
             sbp = patient_cf.loc[idx, STABILITY_COLS["sbp"]]
             o2sat = patient_cf.loc[idx, STABILITY_COLS["o2sat"]]
 
+            # only count as stable if all four vitals are actually
+            # recorded - missing vitals should never count as "stable"
             vitals_present = (
                 pd.notna(temp) and pd.notna(hr)
                 and pd.notna(sbp) and pd.notna(o2sat)
@@ -360,7 +368,7 @@ def create_counterfactual_patient(episode_rows, policy):
 
 
 def update_reinsertion_state(patient_cf):
-    """Unchanged — bookkeeping only, no model calls."""
+    
     at_risk = False
     state = []
     periods_cf = []
@@ -386,6 +394,7 @@ def update_reinsertion_state(patient_cf):
 
 
 def cumulative_risk(patient_cf):
+    # Standard g-formula cumulative risk: 1 - product of (1 - p) across
     p = patient_cf["predicted_probability"].values
     return 1 - np.prod(1 - p)
 
@@ -393,11 +402,6 @@ def cumulative_risk(patient_cf):
 # ==============================================================================
 # PART 3 - IMPLEMENT THE G FORMULA AND RESULTS
 # ==============================================================================
-#
-# cauti_risk_threshold makes its removal decision inside
-# create_counterfactual_patient, exactly like every other policy type, so
-# it flows through update_reinsertion_state and the batched reinsertion
-# prediction the same way — no separate post-hoc block needed.
 
 results = []
 
@@ -405,6 +409,8 @@ for policy_name, policy in POLICIES.items():
 
     episode_frames = []
 
+    # Build the counterfactual trajectory for every episode under this
+    # policy
     for key, episode in df_sim.groupby(EPISODE_KEY):
         cf = create_counterfactual_patient(episode, policy)
 
@@ -423,9 +429,11 @@ for policy_name, policy in POLICIES.items():
     all_cf = pd.concat(episode_frames)
     all_cf["predicted_probability"] = 0.0
 
+    # Only score rows where the patient is actually at risk of reinsertion
     at_risk_mask = all_cf["reinsertion_state_cf"] == "AT_RISK"
     at_risk_rows = all_cf.loc[at_risk_mask]
 
+    # Batch predict ALL at-risk rows in one call rather than looping 
     if len(at_risk_rows) > 0:
         X = at_risk_rows[PREDICTORS_CF].copy()
         X.columns = PREDICTORS
@@ -437,6 +445,7 @@ for policy_name, policy in POLICIES.items():
         probs = calibrated_model.predict_proba(X_imputed)[:, 1]
         all_cf.loc[at_risk_rows.index, "predicted_probability"] = probs
 
+    # Cumulative risk per episode, then average across all episodes
     episode_risks = []
     for key, group in all_cf.groupby(EPISODE_KEY):
         episode_risks.append(cumulative_risk(group))
