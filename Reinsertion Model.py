@@ -34,36 +34,36 @@ PREDICTORS = [
     "age",
     "sex_M",
     "episode_index",
-    "itemid_229371__last",
-    "itemid_220739__last",
-    "itemid_223901__last",
-    "itemid_223900__last",
-    "itemid_220045__mean",
-    "itemid_220052__mean",
-    "itemid_220210__mean",
-    "itemid_223762__mean",
-    "itemid_220615__last",
-    "itemid_225624__last",
-    "itemid_227471__last",
-    "itemid_220546__last",
-    "itemid_229357__last",
-    "itemid_220228__last",
-    "itemid_227457__last",
-    "itemid_220645__last",
-    "itemid_227442__last",
-    "itemid_220602__last",
-    "itemid_220621__last",
-    "itemid_227456__last",
-    "itemid_220644__last",
-    "itemid_220587__last",
-    "itemid_225690__last",
-    "itemid_225612__last",
-    "itemid_227073__last",
-    "itemid_220235__last",
-    "itemid_220224__last",
-    "itemid_220227__last",
-    "itemid_220051__mean",
-    "itemid_220050__mean",
+    "itemid_229371__last",      # Bladder Scan Estimate
+    "itemid_220739__last",      # GCS Eye
+    "itemid_223901__last",      # GCS Motor
+    "itemid_223900__last",      # GCS Verbal
+    "itemid_220045__mean",      # Heart Rate
+    "itemid_220052__mean",      # Arterial Blood Pressure Mean
+    "itemid_220210__mean",      # Respiratory Rate
+    "itemid_223762__mean",      # Temperature (Celsius)
+    "itemid_220615__last",      # Creatinine
+    "itemid_225624__last",      # BUN
+    "itemid_227471__last",      # Urine Specific Gravity
+    "itemid_220546__last",      # White Blood Cell count
+    "itemid_229357__last",      # Absolute Neutrophils
+    "itemid_220228__last",      # Haemoglobin
+    "itemid_227457__last",      # Platelet Count
+    "itemid_220645__last",      # Sodium
+    "itemid_227442__last",      # Potassium
+    "itemid_220602__last",      # Chloride
+    "itemid_220621__last",      # Glucose
+    "itemid_227456__last",      # Albumin
+    "itemid_220644__last",      # ALT
+    "itemid_220587__last",      # AST
+    "itemid_225690__last",      # Total Bilirubin
+    "itemid_225612__last",      # Alkaline Phosphatase
+    "itemid_227073__last",      # Anion Gap
+    "itemid_220235__last",      # Arterial CO2 Pressure
+    "itemid_220224__last",      # Arterial O2 Pressure
+    "itemid_220227__last",      # Arterial O2 Saturation
+    "itemid_220051__mean",      # Arterial BP Diastolic
+    "itemid_220050__mean",      # Arterial BP Systolic
 ]
 
 # IDs and flags I need on top of the predictors - to define risk sets,
