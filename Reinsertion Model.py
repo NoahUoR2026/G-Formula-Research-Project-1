@@ -1,3 +1,4 @@
+
 '''
 REINSERTION PROBABILITY MODEL + G-FORMULA SIMULATION
 (Day + Stability + Hybrid + CAUTI-RISK-THRESHOLD policies)
@@ -34,36 +35,36 @@ PREDICTORS = [
     "age",
     "sex_M",
     "episode_index",
-    "itemid_229371__last",      # Bladder Scan Estimate
-    "itemid_220739__last",      # GCS Eye
-    "itemid_223901__last",      # GCS Motor
-    "itemid_223900__last",      # GCS Verbal
-    "itemid_220045__mean",      # Heart Rate
-    "itemid_220052__mean",      # Arterial Blood Pressure Mean
-    "itemid_220210__mean",      # Respiratory Rate
-    "itemid_223762__mean",      # Temperature (Celsius)
-    "itemid_220615__last",      # Creatinine
-    "itemid_225624__last",      # BUN
-    "itemid_227471__last",      # Urine Specific Gravity
-    "itemid_220546__last",      # White Blood Cell count
-    "itemid_229357__last",      # Absolute Neutrophils
-    "itemid_220228__last",      # Haemoglobin
-    "itemid_227457__last",      # Platelet Count
-    "itemid_220645__last",      # Sodium
-    "itemid_227442__last",      # Potassium
-    "itemid_220602__last",      # Chloride
-    "itemid_220621__last",      # Glucose
-    "itemid_227456__last",      # Albumin
-    "itemid_220644__last",      # ALT
-    "itemid_220587__last",      # AST
-    "itemid_225690__last",      # Total Bilirubin
-    "itemid_225612__last",      # Alkaline Phosphatase
-    "itemid_227073__last",      # Anion Gap
-    "itemid_220235__last",      # Arterial CO2 Pressure
-    "itemid_220224__last",      # Arterial O2 Pressure
-    "itemid_220227__last",      # Arterial O2 Saturation
-    "itemid_220051__mean",      # Arterial BP Diastolic
-    "itemid_220050__mean",      # Arterial BP Systolic
+    "itemid_229371__last",
+    "itemid_220739__last",
+    "itemid_223901__last",
+    "itemid_223900__last",
+    "itemid_220045__mean",
+    "itemid_220052__mean",
+    "itemid_220210__mean",
+    "itemid_223762__mean",
+    "itemid_220615__last",
+    "itemid_225624__last",
+    "itemid_227471__last",
+    "itemid_220546__last",
+    "itemid_229357__last",
+    "itemid_220228__last",
+    "itemid_227457__last",
+    "itemid_220645__last",
+    "itemid_227442__last",
+    "itemid_220602__last",
+    "itemid_220621__last",
+    "itemid_227456__last",
+    "itemid_220644__last",
+    "itemid_220587__last",
+    "itemid_225690__last",
+    "itemid_225612__last",
+    "itemid_227073__last",
+    "itemid_220235__last",
+    "itemid_220224__last",
+    "itemid_220227__last",
+    "itemid_220051__mean",
+    "itemid_220050__mean",
 ]
 
 # IDs and flags I need on top of the predictors - to define risk sets,
@@ -95,11 +96,14 @@ if len(missing_cols) > 0:
     raise ValueError("These columns are missing from the dataset:", missing_cols)
 print("All expected columns are present.")
 
+# Key that uniquely identifies one catheter episode
+EPISODE_KEY = ["subject_id", "hadm_id", "stay_id", "episode_index"]
+
 # Always sort into chronological order per episode
 df_full = df_full.sort_values(
-    ["subject_id", "episode_index", "periods_in_state"]
+    EPISODE_KEY + ["periods_in_state"]
 ).reset_index(drop=True)
-print("Data sorted into time order per patient.")
+print("Data sorted into time order per episode.")
 
 # Restrict to at-risk rows for TRAINING only 
 df_model = df_full[df_full["at_risk_reinsertion"] == 1].copy()
@@ -222,22 +226,18 @@ cauti_model = joblib.load("model_cauti.pkl")
 # PART 2 - BUILD G FORMULA DATASET AND COUNTERFACTUAL TRAJECTORIES
 # ==============================================================================
 
-# Simulation dataset, test split, sorted chronologically 
+# Simulation dataset, test split, sorted chronologically per episode
 df_sim = df_full[df_full["split"] == "test"].copy()
 df_sim = df_sim.sort_values(
-    ["subject_id", "episode_index", "periods_in_state"]
+    EPISODE_KEY + ["periods_in_state"]
 ).reset_index(drop=True)
 
 print("\nSimulation dataset created.")
 print("Rows:    ", len(df_sim))
-print("Patients:", df_sim["subject_id"].nunique())
+print("Episodes:", df_sim.groupby(EPISODE_KEY).ngroups)
 
 df_sim_atrisk = df_sim[df_sim["at_risk_reinsertion"] == 1].copy()
 print("At-risk rows available for policy simulation:", len(df_sim_atrisk))
-
-# group by the full episode key
-EPISODE_KEY = ["subject_id", "hadm_id", "stay_id", "episode_index"]
-TIME_KEY = "interval_hours"
 
 # Swap periods_in_state for periods_in_state_cf in the column list
 PREDICTORS_CF = [
@@ -304,8 +304,14 @@ POLICIES = {
 
 
 def create_counterfactual_patient(episode_rows, policy):
-    # Sort by time and reset the removal flag
-    patient_cf = episode_rows.sort_values(TIME_KEY).copy()
+    # episode_rows arrives already in the correct chronological order:
+    # df_sim was sorted by EPISODE_KEY + periods_in_state earlier, and
+    # groupby() preserves that row order within each group. Re-sorting by
+    # interval_hours here was a bug - interval_hours is a DURATION (hours
+    # until the next observation), not a timestamp, so two periods with
+    # the same interval_hours value could get shuffled into the wrong
+    # order. Just take the rows as they arrive and reset removed_in_period.
+    patient_cf = episode_rows.copy()
     ptype = policy["type"]
 
     patient_cf["removed_in_period"] = 0
@@ -410,7 +416,9 @@ for policy_name, policy in POLICIES.items():
     episode_frames = []
 
     # Build the counterfactual trajectory for every episode under this
-    # policy
+    # policy. Grouping by the full EPISODE_KEY (not just subject_id) so
+    # patients with more than one catheter episode get a separate,
+    # independent simulation restarted for each episode.
     for key, episode in df_sim.groupby(EPISODE_KEY):
         cf = create_counterfactual_patient(episode, policy)
 
@@ -456,6 +464,6 @@ policy_results = pd.DataFrame(results)
 policy_results["Mean Risk (%)"] = (policy_results["Mean Risk"] * 100).round(3)
 
 print("\n" + "=" * 70)
-print("G-FORMULA REINSERTION POLICY RISK ESTIMATES (cumulative per-patient risk)")
+print("G-FORMULA REINSERTION POLICY RISK ESTIMATES (cumulative per-episode risk)")
 print("=" * 70)
 print(policy_results.to_string(index=False))
