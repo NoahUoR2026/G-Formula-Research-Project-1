@@ -1,18 +1,20 @@
 '''
 CAUTI PROBABILITY MODEL + G-FORMULA SIMULATION
+(Day + Stability + Hybrid + CAUTI-RISK-THRESHOLD policies)
 '''
 
-# Import Libraries
-import pandas as pd                                      
-import numpy as np                                       
-import joblib                                           
 
-from sklearn.ensemble import GradientBoostingClassifier  # Gradient Boosting Model
-from sklearn.impute import SimpleImputer                 
-from sklearn.model_selection import GroupKFold, cross_validate  # for cross-validation
-from sklearn.pipeline import Pipeline                    # for chaining steps together
-from sklearn.metrics import roc_auc_score, average_precision_score, brier_score_loss  # evaluation metrics
-from sklearn.calibration import calibration_curve, CalibratedClassifierCV  # for calibration
+import pandas as pd
+import numpy as np
+import joblib
+
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import GroupKFold, cross_validate
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import roc_auc_score, average_precision_score, brier_score_loss
+from sklearn.calibration import calibration_curve, CalibratedClassifierCV
+
 
 
 # ==============================================================================
@@ -20,10 +22,17 @@ from sklearn.calibration import calibration_curve, CalibratedClassifierCV  # for
 # ==============================================================================
 
 
-# Target Column for prediction (did the patient get a CAUTI in this period?)
-TARGET = "cauti_in_period"
+DATA_PATH = "Dataset.csv"   # authoritative source - the CSV has fewer columns
+DRY_RUN = False              # True = structural checks only, skip model training
 
-# These are the patient characteristics used to make the prediction.
+TARGET = "cauti_in_period"
+STAY_KEY = ["subject_id", "hadm_id", "stay_id"]
+RUN_KEY = STAY_KEY + ["cath_run"]
+
+# Fallback if the panel window cannot be measured (see Part 0, step 5)
+DEFAULT_WINDOW_HOURS = 48.0
+
+
 PREDICTORS = [
     "age",
     "sex_M",
@@ -62,205 +71,345 @@ PREDICTORS = [
     "itemid_220050__mean",      # Arterial BP Systolic
 ]
 
-
 EXTRA_COLS = [
-    "subject_id",           # unique patient identifier
-    "hadm_id",              # Hospital admission ID
-    "stay_id",              # ICU stay ID
-    "episode_index",        # which catheter episode this row belongs to
-    "periods_in_state",     # time periods in current state (used for sorting and for policies)
-    "interval_hours",       # hours since last observation
-    "removed_in_period",    # was the catheter removed in this time period? (the intervention)
-    "at_risk_cauti",        # is this patient currently at risk of CAUTI?
-    "at_risk_reinsertion",  # is this patient currently at risk of reinsertion?
-    "cauti_in_period",      # did the patient get CAUTI in this period? (outcome)
-    "reinsertion_in_period",# was the catheter reinserted in this period? (second outcome)
-    "split",                # tells us if this row is training or test data
+    "subject_id",
+    "hadm_id",
+    "stay_id",
+    "episode_index",
+    "periods_in_state",
+    "interval_hours",
+    "removed_in_period",
+    "reinsertion_in_period",
+    "at_risk_cauti",            # catheter in place OR inside the panel's own window
+    "at_risk_reinsertion",      # catheter out -> used to identify catheter-in rows
+    "cauti_in_period",
+    "split",
+    # Stability trigger only, not model predictors.
+    "itemid_223762__last",      # Temperature (C)
+    "itemid_220045__last",      # Heart Rate
+    "itemid_220050__last",      # Arterial BP Systolic  (42.8% present)
+    "itemid_220179__last",      # NBP Systolic          (70.3% present)
+    "itemid_220227__last",      # Arterial O2 Sat       (13.7% present)
+    "itemid_220277__last",      # O2 Sat, pulse ox      (94.4% present)
 ]
 
-# Combine predictor columns and extra columns into one list 
-all_columns_needed = list(set(PREDICTORS + EXTRA_COLS))
+# --- 1. Sort into time order -------------------------------------------------
+# Sorting on stay first, then episode_index. episode_index is a per-period row
+# counter, so within a stay it is the closest thing to a timestamp available.
+# periods_in_state is deliberately NOT a sort key: it resets on every state
+# change, so using it reorders rows across state boundaries.
+df_full = df_full.sort_values(
+    ["subject_id", "hadm_id", "stay_id", "episode_index"]
+).reset_index(drop=True)
+print("Data sorted by stay then episode_index.")
 
-# Load the data 
-print("Loading data...")
-df_full = pd.read_csv("Dataset.csv", usecols=all_columns_needed)
-print("Data loaded. Shape:", df_full.shape)  # prints (rows, columns)
+
+# --- 2. Catheter state -------------------------------------------------------
+# The diagnostics showed 18,112 rows flagged at risk of BOTH CAUTI and
+# reinsertion, and zero rows flagged at risk of neither. A patient can only be
+# reinsertion-eligible once the catheter is out, so at_risk_cauti spans
+# catheterised rows AND the panel's own post-removal window. That makes
+# at_risk_reinsertion the clean state indicator.
+df_full["cath_in_observed"] = (df_full["at_risk_reinsertion"] == 0).astype(int)
+df_full["cath_out_observed"] = 1 - df_full["cath_in_observed"]
+
+n_in = int(df_full["cath_in_observed"].sum())
+n_out = int(df_full["cath_out_observed"].sum())
+n_neither = int(((df_full["at_risk_cauti"] == 0) & (df_full["at_risk_reinsertion"] == 0)).sum())
+
+print("\n" + "-" * 70)
+print("STRUCTURAL CHECKS")
+print("-" * 70)
+print("Catheterised rows (at_risk_reinsertion == 0):", n_in)
+print("Catheter-out rows:                           ", n_out)
+print("Rows at risk of neither (want 0):            ", n_neither)
+
+if n_neither > 0:
+    print("  WARNING: some rows are at risk of neither outcome, so at_risk_reinsertion == 0")
+    print("  no longer implies the catheter is in. Load state_is_out and use that instead.")
+
+# Every recorded removal must sit on a catheterised row
+rem_off = int(((df_full["removed_in_period"] == 1) & (df_full["cath_in_observed"] == 0)).sum())
+print("Removals on non-catheterised rows (want 0):  ", rem_off)
 
 
-# Check if any expected columns are missing from the loaded data
-missing_cols = []
+# --- 3. Catheter-in runs ------------------------------------------------------
+# A run opens when the catheter goes out -> in. Out-of-catheter rows inherit the
+# preceding run id, so one run = one insertion, its removal, and the periods
+# that follow it. episode_index is not used for grouping anywhere.
+in_flag = df_full["cath_in_observed"] == 1
+prev_in = (
+    in_flag.groupby([df_full[c] for c in STAY_KEY], sort=False)
+    .shift(1).fillna(False).astype(bool)
+)
+run_start = (in_flag & ~prev_in).astype(int)
+df_full["cath_run"] = run_start.groupby([df_full[c] for c in STAY_KEY], sort=False).cumsum()
 
-for col in all_columns_needed:
+n_stays = df_full.groupby(STAY_KEY, sort=False).ngroups
+n_reins = int((df_full["reinsertion_in_period"] == 1).sum())
+n_removals = int((df_full["removed_in_period"] == 1).sum())
+n_runs = int(run_start.sum())
 
-    if col not in df_full.columns:
-        missing_cols.append(col)
+print("\nUnique ICU stays:                  ", n_stays)
+print("Reinsertion events:                ", n_reins)
+print("Expected insertions (stays+reins): ", n_stays + n_reins)
+print("Catheter-in runs detected:         ", n_runs)
+print("Removal events:                    ", n_removals)
 
-# If any are missing, stop the script and output which ones
-if len(missing_cols) > 0:
-    raise ValueError("These columns are missing from the dataset:", missing_cols)
+if abs(n_runs - (n_stays + n_reins)) > 0.05 * (n_stays + n_reins):
+    print("  WARNING: run count does not match the expected insertion count.")
+    print("  Do not trust the per-run results until this is reconciled.")
 
+
+# --- 4. Within-run day counter -----------------------------------------------
+# Policy triggers need days since THIS insertion. periods_in_state should supply
+# that, but the diagnostics showed non-monotonic sequences within a stay, so a
+# positional counter over catheterised rows is used instead and the agreement
+# with periods_in_state is reported. Low agreement means the row ordering is
+# unreliable and every time-based result in this script is suspect.
+in_rows_mask = df_full["cath_in_observed"] == 1
+df_full["policy_day"] = np.nan
+df_full.loc[in_rows_mask, "policy_day"] = (
+    df_full.loc[in_rows_mask].groupby(RUN_KEY, sort=False).cumcount() + 1
+)
+
+agree = (
+    df_full.loc[in_rows_mask, "policy_day"]
+    == df_full.loc[in_rows_mask, "periods_in_state"]
+).mean()
+print("\npolicy_day agrees with periods_in_state on %.1f %% of catheterised rows"
+      % (float(agree) * 100))
+
+if agree < 0.90:
+    print("  WARNING: ordering is not consistent with periods_in_state.")
+    print("  Inspect the dump below before reporting any day-based policy result.")
+    sample_run = df_full[df_full["cath_run"] == 1].groupby(STAY_KEY, sort=False)
+    for i, (key, g) in enumerate(sample_run):
+        if len(g) >= 6:
+            print("\n  stay", key)
+            print(g[["episode_index", "periods_in_state", "interval_hours",
+                     "cath_in_observed", "removed_in_period",
+                     "reinsertion_in_period", "at_risk_cauti", "policy_day"]]
+                  .head(14).to_string(index=False))
+        if i >= 1:
+            break
+
+
+# --- 5. Measure the panel's existing post-removal window ---------------------
+# Rather than assuming 48h, work out how long the panel itself keeps a patient
+# CAUTI-at-risk after removal, then reuse that in the counterfactual.
+df_full["_ih"] = df_full["interval_hours"].fillna(0.0).astype(float)
+df_full["_t_end"] = df_full.groupby(STAY_KEY, sort=False)["_ih"].cumsum()
+df_full["_t_start"] = df_full["_t_end"] - df_full["_ih"]
+df_full["_t_rem"] = df_full["_t_end"].where(df_full["removed_in_period"] == 1)
+df_full["_t_rem"] = df_full.groupby(STAY_KEY, sort=False)["_t_rem"].ffill()
+df_full["hours_since_removal"] = df_full["_t_start"] - df_full["_t_rem"]
+
+out_at_risk = (df_full["cath_out_observed"] == 1) & (df_full["at_risk_cauti"] == 1)
+out_not_risk = (df_full["cath_out_observed"] == 1) & (df_full["at_risk_cauti"] == 0)
+
+print("\n" + "-" * 70)
+print("PANEL'S EXISTING POST-REMOVAL CAUTI WINDOW")
+print("-" * 70)
+print("Catheter-out rows still CAUTI-at-risk:", int(out_at_risk.sum()))
+print("Catheter-out rows no longer at risk:  ", int(out_not_risk.sum()))
+
+hrs_at_risk = df_full.loc[out_at_risk, "hours_since_removal"].dropna()
+hrs_dropped = df_full.loc[out_not_risk, "hours_since_removal"].dropna()
+
+# hours_since_removal is measured at the START of a period, so the window's
+# upper edge is that plus the period's own duration.
+end_at_risk = (
+    df_full.loc[out_at_risk, "hours_since_removal"]
+    + df_full.loc[out_at_risk, "interval_hours"].fillna(0.0)
+).dropna()
+
+measured = np.nan
+
+if len(hrs_at_risk) > 0:
+    print("\nHours since removal at the START of at-risk out-rows:")
+    print(hrs_at_risk.describe(percentiles=[0.5, 0.9, 0.99]).round(2).to_string())
+    w_hi = float(end_at_risk.quantile(0.99))
+    print("\nUpper edge of the last at-risk period (99th pct): %.1f h" % w_hi)
+else:
+    w_hi = np.nan
+
+if len(hrs_dropped) > 0:
+    # The boundary: the earliest point at which the panel stops counting a
+    # patient as at risk. This is the cleanest estimator of the window length.
+    w_lo = float(hrs_dropped.quantile(0.05))
+    print("Earliest point the panel drops a patient from the risk set (5th pct): %.1f h" % w_lo)
+    measured = w_lo
+elif np.isfinite(w_hi):
+    measured = w_hi
+
+if np.isfinite(w_hi) and np.isfinite(measured) and abs(w_hi - measured) > 24.0:
+    print("  NOTE: the two estimates disagree by more than a day. The panel's window may")
+    print("  not be a fixed number of hours - check before quoting a figure in the methods.")
+
+# CAUTI events actually recorded after removal. If this is zero, the outcome is
+# only ever recorded while the catheter is in, and the post-removal window is an
+# assumption about exposure rather than something estimated from data.
+if int(out_at_risk.sum()) > 0:
+    print("\nCAUTI rate, catheterised rows:      %.5f"
+          % float(df_full.loc[df_full["cath_in_observed"] == 1, TARGET].mean()))
+    print("CAUTI rate, post-removal at-risk:   %.5f"
+          % float(df_full.loc[out_at_risk, TARGET].mean()))
+    print("CAUTI events post-removal:          %d"
+          % int(df_full.loc[out_at_risk, TARGET].fillna(0).sum()))
+
+# Use the measured window where it is sensible, otherwise the default
+if np.isfinite(measured) and 6.0 <= measured <= 240.0:
+    POST_REMOVAL_WINDOW_HOURS = float(np.round(measured))
+    print("\nUsing MEASURED window: %.1f h" % POST_REMOVAL_WINDOW_HOURS)
+else:
+    POST_REMOVAL_WINDOW_HOURS = DEFAULT_WINDOW_HOURS
+    print("\nUsing DEFAULT window: %.1f h (measurement unavailable or implausible)"
+          % POST_REMOVAL_WINDOW_HOURS)
+
+df_full = df_full.drop(columns=["_ih", "_t_end", "_t_start", "_t_rem"])
+
+
+# --- 6. Run-length distribution and positivity -------------------------------
+run_len = (
+    df_full[df_full["cath_in_observed"] == 1]
+    .groupby(RUN_KEY, sort=False)["policy_day"].max()
+)
+print("\n" + "-" * 70)
+print("POSITIVITY - CATHETERISED PERIODS PER RUN")
+print("-" * 70)
+print("median %.0f  mean %.2f  max %.0f"
+      % (run_len.median(), run_len.mean(), run_len.max()))
+for day in range(1, 8):
+    share = float((run_len >= day).mean()) * 100
+    print("  reach day %d: %5.1f %%  -> expected violation %5.1f %%" % (day, share, 100 - share))
+
+if DRY_RUN:
+    print("\nDRY_RUN = True - stopping before model training.")
+    raise SystemExit(0)
+
+
+# Load data
+print("Loading data ...")
+df_full = pd.read_csv("dataset.csv", usecols=(all_columns_needed))
+print("Data loaded. Shape:", df_full.shape)
+
+missing_cols = [c for c in all_columns_needed if c not in df_full.columns]
+if missing_cols:
+    raise ValueError("These columns are missing from the dataset: " + str(missing_cols))
 print("All expected columns are present.")
 
+df_full["cath_run"] = run_start.groupby([df_full[c] for c in STAY_KEY], sort=False).cumsum()
 
-# Key that uniquely identifies one catheter episode - simulation must run
-# within this, independently. Defined up here (rather than only in Part 2)
-# because we now sort by it straight away.
-EPISODE_KEY = ["subject_id", "hadm_id", "stay_id", "episode_index"]
-
-# Sort the data into time order, within each catheter episode
+# Sort into time order 
 df_full = df_full.sort_values(
-    EPISODE_KEY + ["periods_in_state"]
-).reset_index(drop=True)  # reset_index gives a clean 0,1,2 row index after sorting
-print("Data sorted into time order per episode.")
+    ["subject_id", "hadm_id", "stay_id", "episode_index"]
+).reset_index(drop=True)
+print("Data sorted by stay then episode_index.")
 
 
-# filter to at risk rows only for model training 
-df_model = df_full[df_full["at_risk_cauti"] == 1].copy()  # .copy() prevents accidental edits to df_full
 
-print("Rows used for model training (at risk only):", len(df_model))
-print("Rows kept aside for g-formula simulation (all rows):", len(df_full))
+# Training rows: the panel's own at-risk definition.
+df_model = df_full[df_full["at_risk_cauti"] == 1].copy()
 
+n_before = len(df_model)
+df_model = df_model[df_model[TARGET].notna()].copy()
+print("\nRows dropped for missing outcome:", n_before - len(df_model))
+print("Rows used for model training:", len(df_model))
+print("Rows kept for g-formula simulation:", len(df_full))
 
-# split into train and test data using dataset 'split' column
-df_train = df_model[df_model["split"] == "train"].copy()  # rows for training the model
-df_test  = df_model[df_model["split"] == "test"].copy()   # rows for evaluating the model
-
+# Split using predefined "Split column"
+df_train = df_model[df_model["split"] == "train"].copy()
+df_test = df_model[df_model["split"] == "test"].copy()
 print("Training rows:", len(df_train))
-print("Test rows:",     len(df_test))
+print("Test rows:    ", len(df_test))
 
+X_train = df_train[PREDICTORS]
+y_train = df_train[TARGET]
+X_test = df_test[PREDICTORS]
+y_test = df_test[TARGET]
 
-# X = the input features the model uses to make predictions
-# y = the thing being predicted (did they get CAUTI?)
-
-X_train = df_train[PREDICTORS]   # training features
-y_train = df_train[TARGET]       # training outcome
-
-X_test = df_test[PREDICTORS]     # test features
-y_test = df_test[TARGET]         # test outcome
-
-print("X_train shape:", X_train.shape)
-print("X_test shape:", X_test.shape)
-
-# Get patient IDs from training data for grouped cross-validation.
+# Group by column for k fold validation
 groups = df_train["subject_id"]
 
+print("X_train shape:", X_train.shape)
+print("X_test shape: ", X_test.shape)
 
-
-# How common is CAUTI in actual data
-print("\nHow often does CAUTI occur in the TRAINING data?")
-print(y_train.value_counts())                          # raw counts
-print(y_train.value_counts(normalize=True).round(4))   # as proportions
-
-print("\nHow often does CAUTI occur in the TEST data?")
+#Get Frequency of CAUTI in training and test data 
+print("\nCAUTI frequency, TRAINING data:")
+print(y_train.value_counts())
+print(y_train.value_counts(normalize=True).round(4))
+print("\nCAUTI frequency, TEST data:")
 print(y_test.value_counts())
+
+# Get actual rate of CAUTI in dataset
 print(y_test.value_counts(normalize=True).round(4))
+print("\nbaseline rate:", round(y_test.mean(), 4))
 
-# The baseline rate is the proportion of positive cases.
-# A model that just guesses randomly would score around this value on AUPRC.
-baseline_rate = y_test.mean()
-print("\nbaseline rate:", round(baseline_rate, 4))
+# Impute missing values
+imputer = SimpleImputer(strategy="median")
+X_train = pd.DataFrame(imputer.fit_transform(X_train), columns=PREDICTORS)
+X_test = pd.DataFrame(imputer.transform(X_test), columns=PREDICTORS)
+print("missing after:", "Training =", X_train.isna().sum().sum(),
+      "Test =", X_test.isna().sum().sum())
 
-
-
-# fill in missing values
-imputer = SimpleImputer(strategy="median")             # create the imputer
-X_train = pd.DataFrame(imputer.fit_transform(X_train), columns=PREDICTORS)  # fit on training data and fill missing values
-X_test = pd.DataFrame(imputer.transform(X_test), columns=PREDICTORS)        # apply same medians to test data (no refitting)
-
-print("missing after:", "Training =", X_train.isna().sum().sum(), "Test =", X_test.isna().sum().sum())
-
-# Save the fitted imputer to disk to use later
+# Save for use later
 joblib.dump(imputer, "imputer_cauti.pkl")
 print("Imputer saved to: imputer_cauti.pkl")
 
-
-
-# Set up the model 
+# Use Gradient Boosting Classifier ML model 
 model = GradientBoostingClassifier(
-    n_estimators=300,    # build 300 decision trees
-    learning_rate=0.03,  # each tree contributes a small amount (helps avoid overfitting)
-    max_depth=2,         # each tree is kept shallow (simple)
-    subsample=0.8,       # each tree only sees 80% of the training data (adds variety)
-    random_state=42      # makes results reproducible
+    n_estimators=300,
+    learning_rate=0.03,
+    max_depth=2,
+    subsample=0.8,
+    random_state=42
 )
 
-# chain the imputer and model together into one object.
 pipeline = Pipeline([("imputer", SimpleImputer(strategy="median")), ("model", model)])
+group_kfold = GroupKFold(n_splits=5)
 
-# Ensure the same patient never appears in both the training fold and the validation fold during cross-validation.
-group_kfold = GroupKFold(n_splits=5)  # split into 5 folds
-
-# Run cross-validation and collect three metrics
+# Cross Validate with all three metrics
 cv_results = cross_validate(
-    pipeline,
-    X_train,
-    y_train,
-    cv=group_kfold,
-    groups=groups,
+    pipeline, X_train, y_train,
+    cv=group_kfold, groups=groups,
     scoring=["roc_auc", "average_precision", "neg_brier_score"]
 )
 
-# Print average scores across the 5 folds
-print("Cross-Validation Results (average across 5 folds)")
-# how well the model ranks patients
+print("\nCross-Validation Results (average across 5 folds)")
 print("ROC-AUC:", round(cv_results["test_roc_auc"].mean(), 4))
-# precision-recall performance            
-print("AUPRC:  ", round(cv_results["test_average_precision"].mean(), 4)) 
-# overall probability accuracy 
-print("Brier:  ", round((-cv_results["test_neg_brier_score"]).mean(), 4)) 
+print("AUPRC:  ", round(cv_results["test_average_precision"].mean(), 4))
+print("Brier:  ", round((-cv_results["test_neg_brier_score"]).mean(), 4))
 
-
-
-# train the final model and calibrate
-calibrated_model = CalibratedClassifierCV(
-    estimator=pipeline,  # the model pipeline to calibrate
-    method="isotonic",   # isotonic regression calibration (best for rare outcomes)
-    cv=5                 # uses 5-fold cross-fitting internally (avoids circularity vs cv="prefit")
-)
-
-# Train the calibrated model on all training data
+# Calibrate model using isotonic regression
+calibrated_model = CalibratedClassifierCV(estimator=pipeline, method="isotonic", cv=5)
 calibrated_model.fit(X_train, y_train)
 print("Model trained and calibrated.")
 
-# Save the calibrated model to disk for use later
+#Save calibrated model results for use later
 joblib.dump(calibrated_model, "model_cauti.pkl")
 print("Calibrated model saved to: model_cauti.pkl")
 
-
-
-# Generate the predicted probabilities
 y_prob = calibrated_model.predict_proba(X_test)[:, 1]
-
 print("\nPredicted CAUTI probability summary (test set):")
 print("Minimum: ", round(y_prob.min(), 4))
 print("Maximum: ", round(y_prob.max(), 4))
 print("Average: ", round(y_prob.mean(), 4))
 
-
-
-# Check how well calibrated the probability outputs are
-# Calibration means: when the model says 10% probability, does CAUTI happen 10% of the time?
-fraction_pos_uniform, mean_pred_uniform = calibration_curve(y_test, y_prob, n_bins=10, strategy="uniform")
-mace_uniform = np.mean(np.abs(fraction_pos_uniform - mean_pred_uniform))
-
-# calibration using quantile bins
-fraction_pos_quantile, mean_pred_quantile = calibration_curve(y_test, y_prob, n_bins=10, strategy="quantile")
-mace_quantile = np.mean(np.abs(fraction_pos_quantile - mean_pred_quantile))
+# Get MACE scores for overall model calibration
+fraction_pos_u, mean_pred_u = calibration_curve(y_test, y_prob, n_bins=10, strategy="uniform")
+mace_uniform = np.mean(np.abs(fraction_pos_u - mean_pred_u))
+fraction_pos_q, mean_pred_q = calibration_curve(y_test, y_prob, n_bins=10, strategy="quantile")
+mace_quantile = np.mean(np.abs(fraction_pos_q - mean_pred_q))
 
 print("\nCalibration check:")
-print("Uniform-binned MACE: ", round(mace_uniform, 4), " (can be inflated by sparse high-probability bins)")
-print("Quantile-binned MACE:", round(mace_quantile, 4), " (more reliable diagnostic for a rare outcome)")
+print("Uniform-binned MACE: ", round(mace_uniform, 4), " (inflated by sparse high-probability bins)")
+print("Quantile-binned MACE:", round(mace_quantile, 4), " (the meaningful figure for a rare outcome)")
 
-
-
-# Evalution metrics 
-
-# how well the model separates cases from non-cases
+# Get ROC-AUC (Discrimination), AUPRC (Precision), and Brier Scores (Accuracy)
 roc_auc = roc_auc_score(y_test, y_prob)
-# performance under class imbalance           
-auprc   = average_precision_score(y_test, y_prob) 
-# overall error in predicted probabilities
-brier   = brier_score_loss(y_test, y_prob)        
+auprc = average_precision_score(y_test, y_prob)
+brier = brier_score_loss(y_test, y_prob)
 
 print("\n" + "=" * 55)
 print("PROBABILITY MODEL EVALUATION")
@@ -269,96 +418,36 @@ print("ROC-AUC:", round(roc_auc, 4))
 print("AUPRC:  ", round(auprc, 4))
 print("Brier:  ", round(brier, 4))
 
-# Check for overfitting: if train ROC-AUC is much higher than test, the model has overfit
 train_prob = calibrated_model.predict_proba(X_train)[:, 1]
 print("Train ROC-AUC:", round(roc_auc_score(y_train, train_prob), 4))
 print("Test ROC-AUC: ", round(roc_auc, 4))
-print("(A big gap between these two suggests overfitting)")
 
 
 # ==============================================================================
-# PART 2 - BUILD G FORMULA DATASET AND COUNTERFACTUAL TRAJECTORIES 
+# PART 2 - G-FORMULA DATASET AND COUNTERFACTUAL TRAJECTORIES
 # ==============================================================================
 
-# How many hours after removal CAUTI risk should remain active for.
-# Clinically, catheter-associated infection risk doesn't vanish the instant
-# the catheter comes out - there's a residual risk window. 48 hours is the
-# window David asked for; change this single constant if the report settles
-# on a different clinically-justified figure.
-POST_REMOVAL_RISK_WINDOW_HOURS = 48
-
-# Build the simulation dataset for the g formula to be implemented
-# The g-formula needs the FULL patient timeline (not just at-risk rows)
 df_sim = df_full[df_full["split"] == "test"].copy()
-
-# Make sure it is still in time order (within each catheter episode)
 df_sim = df_sim.sort_values(
-    EPISODE_KEY + ["periods_in_state"]
+    ["subject_id", "hadm_id", "stay_id", "episode_index"]
 ).reset_index(drop=True)
 
 print("\nSimulation dataset created.")
 print("Rows:    ", len(df_sim))
-print("Episodes:", df_sim.groupby(EPISODE_KEY).ngroups)
-
-# Now restrict down to just the rows where the patient was actually at risk of CAUTI.
-df_sim_atrisk = df_sim[df_sim["at_risk_cauti"] == 1].copy()
-print("At-risk rows available for policy simulation:", len(df_sim_atrisk))
-
-# ==============================================================================
-# PERIOD_NUMBER - a policy-independent "periods since catheter insertion" counter
-# ==============================================================================
-#
-# BUG 1 THIS FIXES: the real "periods_in_state" column counts periods spent
-# in the CURRENT real catheter state, and resets to 1 every time the real
-# catheter state actually changes. If a patient's real catheter came out on
-# day 2, periods_in_state for day 3 onward starts recounting OUT-state days
-# from 1 - it stops meaning "periods since insertion". Driving day-based
-# triggers off this column is why every policy collapsed to the same risk:
-# the triggers fired at inconsistent, meaningless points.
-#
-# period_number is a clean 1, 2, 3, ... position within the episode that
-# never resets - the correct basis for "the catheter has been in
-# continuously since episode start until this policy removes it".
-df_sim["period_number"] = df_sim.groupby(EPISODE_KEY).cumcount() + 1
-
-# ==============================================================================
-# PRECOMPUTE "IF STILL CATHETERISED" CAUTI PROBABILITIES
-# ==============================================================================
-#
-# Replaces the old single "baseline_probability" column, which fed the model
-# the real (possibly reset) periods_in_state. Here period_number is fed in
-# as periods_in_state instead, so every row is scored as "what would CAUTI
-# risk be on this period, assuming the catheter has been in continuously
-# since episode start" - exactly the assumption every policy shares right up
-# until its own removal trigger fires. That makes this valid for ALL policies
-# at once, so it is computed once in a single batched call.
-print("Precomputing 'if still catheterised' CAUTI probabilities...")
-
-X_if_in = df_sim[PREDICTORS].copy()
-X_if_in["periods_in_state"] = df_sim["period_number"]
-
-df_sim["predicted_probability_if_in"] = calibrated_model.predict_proba(X_if_in)[:, 1]
-
-print("Done. Mean 'if in' risk per row:", round(df_sim["predicted_probability_if_in"].mean(), 5))
-
-# Predictor list used for scoring rows in the post-removal 48h window, where
-# periods_in_state must reflect periods SINCE REMOVAL rather than period_number
-# (see periods_in_state_cf built in update_catheter_state).
-PREDICTORS_CF = [
-    "periods_in_state_cf" if col == "periods_in_state" else col
-    for col in PREDICTORS
-]
+print("Patients:", df_sim["subject_id"].nunique())
 
 
-# Clinical stability criteria - four vitals need to all be within safe
-# ranges before a patient counts as "stable" for the stability-based
-# policies below. Using __last for O2 sat and __mean for the other three,
-# consistent with the column availability in the dataset.
-STABILITY_COLS = {
-    "temp": "itemid_223762__mean",    # Temperature (C) < 38 C
-    "hr": "itemid_220045__mean",      # Heart Rate < 100
-    "sbp": "itemid_220050__mean",     # Arterial BP Systolic > 100
-    "o2sat": "itemid_220227__last",   # Arterial O2 Saturation > 94%
+
+# --- Stability criteria: coalesce arterial -> non-invasive -------------------
+# Arterial O2 saturation is present on 13.7% of rows and arterial systolic on
+# 42.8%, because both need an arterial line. Pulse oximetry (94.4%) and NBP
+# (70.3%) are recorded on nearly everyone. Taking arterial where available and
+# falling back to non-invasive raises assessability from 32.5% to 92.1%.
+STABILITY_SOURCES = {
+    "temp":  ["itemid_223762__last"],
+    "hr":    ["itemid_220045__last"],
+    "sbp":   ["itemid_220050__last", "itemid_220179__last"],
+    "o2sat": ["itemid_220227__last", "itemid_220277__last"],
 }
 
 STABILITY_THRESHOLDS = {
@@ -369,63 +458,49 @@ STABILITY_THRESHOLDS = {
 }
 
 
-# Define the counterfactual removal policies.
+
+# --- Policies ----------------------------------------------------------------
+# Thresholds above the max predicted probability can never fire, so the 25% and
+# 50% variants are removed rather than reported as degenerate.
 POLICIES = {
-    # Natural practice
-    "Observed Practice": {
-        "type": "natural"
-    },
-    # Fixed removal days
+    "Observed Practice": {"type": "natural"},
     "Remove day 1": {"type": "day", "day": 1},
     "Remove day 2": {"type": "day", "day": 2},
     "Remove day 3": {"type": "day", "day": 3},
     "Remove day 4": {"type": "day", "day": 4},
     "Remove day 5": {"type": "day", "day": 5},
     "Remove day 6": {"type": "day", "day": 6},
-    # Remove as soon as clinically stable
     "Clinical stability": {"type": "stability"},
-    # Stable only after minimum of 3 days
     "Clinical stability (≥ Day 3)": {"type": "stability_min_day", "min_day": 3},
-    # Hybrid policies
     "Hybrid (stability OR day 4 cap)": {"type": "hybrid", "day_cap": 4},
     "Hybrid (stability OR day 5 cap)": {"type": "hybrid", "day_cap": 5},
     "Hybrid (stability OR day 6 cap)": {"type": "hybrid", "day_cap": 6},
-    # CAUTI probability-triggered policies
-    "Remove when CAUTI risk ≥ 1%":  {"type": "risk_threshold", "threshold": 0.01},
-    "Remove when CAUTI risk ≥ 2%":  {"type": "risk_threshold", "threshold": 0.02},
-    "Remove when CAUTI risk ≥ 5%":  {"type": "risk_threshold", "threshold": 0.05},
+    "Remove when CAUTI risk ≥ 1%": {"type": "risk_threshold", "threshold": 0.01},
+    "Remove when CAUTI risk ≥ 2%": {"type": "risk_threshold", "threshold": 0.02},
+    "Remove when CAUTI risk ≥ 5%": {"type": "risk_threshold", "threshold": 0.05},
     "Remove when CAUTI risk ≥ 10%": {"type": "risk_threshold", "threshold": 0.10},
-    "Remove when CAUTI risk ≥ 25%": {"type": "risk_threshold", "threshold": 0.25},
-    "Remove when CAUTI risk ≥ 50%": {"type": "risk_threshold", "threshold": 0.50},
 }
 
-
-# Function to check whether a policy's removal trigger is met on this row.
+# Function to see if policy removal trigger been met 
 def check_removal_trigger(row, policy):
 
     ptype = policy["type"]
 
-    # Fixed-day removal - trigger once period_number reaches the target day.
-    # Uses period_number (NOT periods_in_state) so "day 6" reliably means the
-    # 6th period since insertion for every policy.
+    # Fixed-day removal - policy_day counts catheterised periods since this
+    # insertion, so it is unaffected by state changes elsewhere in the stay.
     if ptype == "day":
-        return row["period_number"] >= policy["day"]
+        return row["policy_day"] >= policy["day"]
 
-    # Risk-threshold removal - uses predicted_probability_if_in, which was
-    # computed with period_number substituted in for periods_in_state, so
-    # this is a properly-formed "risk so far, assuming still catheterised"
-    # value rather than one built on a possibly-reset real duration column.
     if ptype == "risk_threshold":
-        return row["predicted_probability_if_in"] >= policy["threshold"]
+        return row["baseline_probability"] >= policy["threshold"]
 
-    # Everything else (stability-based policies) needs the four vitals
-    temp = row[STABILITY_COLS["temp"]]
-    hr = row[STABILITY_COLS["hr"]]
-    sbp = row[STABILITY_COLS["sbp"]]
-    o2sat = row[STABILITY_COLS["o2sat"]]
+    # Stability policies - coalesced vitals
+    temp = row[STABILITY_COLS_USED["temp"]]
+    hr = row[STABILITY_COLS_USED["hr"]]
+    sbp = row[STABILITY_COLS_USED["sbp"]]
+    o2sat = row[STABILITY_COLS_USED["o2sat"]]
 
-    # only count as stable if all four vitals are actually recorded -
-    # missing vitals should never count as "stable"
+    # missing vitals must never count as stable
     vitals_present = (
         pd.notna(temp) and pd.notna(hr)
         and pd.notna(sbp) and pd.notna(o2sat)
@@ -443,192 +518,163 @@ def check_removal_trigger(row, policy):
         return is_stable
 
     if ptype == "stability_min_day":
-        return is_stable and (row["period_number"] >= policy["min_day"])
+        return is_stable and (row["policy_day"] >= policy["min_day"])
 
     if ptype == "hybrid":
-        return is_stable or (row["period_number"] >= policy["day_cap"])
+        return is_stable or (row["policy_day"] >= policy["day_cap"])
 
-    # Shouldn't get here if POLICIES is defined correctly
     return False
 
+# Function to apply one policy to one catheter run-in
+def create_counterfactual_run(run_rows, policy):
 
-# Function to create a counterfactual episode
-def create_counterfactual_patient(patient_rows, policy):
+    run_cf = run_rows.copy()
+    run_cf["positivity_violation"] = 0
 
-    # create a copy of the episode
-    patient_cf = patient_rows.copy()
+    if policy["type"] == "natural":
+        return run_cf
 
-    ptype = policy["type"]
+    run_cf["removed_in_period"] = 0
 
-    # Natural practice - use the real observed removal timing as-is.
-    # update_catheter_state (called on every policy) rebuilds the IN/OUT
-    # timeline and the 48h window from whatever removed_in_period says.
-    if ptype == "natural":
-        return patient_cf
-
-    # reset removal flag - this is a counterfactual so we decide removal fresh
-    patient_cf["removed_in_period"] = 0
+    # removal can only be decided on rows where the catheter was in place
+    in_idx = run_cf.index[run_cf["cath_in_observed"] == 1]
+    if len(in_idx) == 0:
+        return run_cf
 
     removed = False
 
-    # loop through each period in the episode
-    for idx in patient_cf.index:
+    for idx in in_idx:
 
-        # once removal has already been triggered, no further removals
         if removed:
             continue
 
-        row = patient_cf.loc[idx]
-
-        # check whether THIS policy's trigger condition is met yet
-        trigger = check_removal_trigger(row, policy)
-
-        if trigger:
-            patient_cf.loc[idx, "removed_in_period"] = 1
+        if check_removal_trigger(run_cf.loc[idx], policy):
+            run_cf.loc[idx, "removed_in_period"] = 1
             removed = True
 
-    return patient_cf
+    # The run ended before the policy could fire. Removal defaults to the
+    # observed end of catheterisation
+    if not removed:
+        run_cf.loc[in_idx[-1], "removed_in_period"] = 1
+        run_cf["positivity_violation"] = 1
+
+    return run_cf
 
 
-# Function to update catheter state, the 48h CAUTI at-risk window, and the
-# counterfactual duration feature periods_in_state_cf.
-#
-# BUG 2 THIS FIXES: hours_since_removal is now a RUNNING TOTAL of
-# interval_hours across the OUT periods. interval_hours is a per-period
-# DURATION, not a running clock, so the old "hours[i] - removal_time" was
-# subtracting two unrelated interval lengths rather than accumulating real
-# elapsed time since removal - which broke the 48h window entirely.
-def update_catheter_state(patient_cf,
-                          post_removal_window_hours=POST_REMOVAL_RISK_WINDOW_HOURS):
+def update_catheter_state(run_cf, window_hours):
 
-    patient_cf = patient_cf.copy()
+    removed = run_cf["removed_in_period"].to_numpy()
+    ih = run_cf["interval_hours"].fillna(0.0).to_numpy(dtype=float)
 
-    removed = patient_cf["removed_in_period"].to_numpy()
-    hours = patient_cf["interval_hours"].to_numpy()
-    period_number = patient_cf["period_number"].to_numpy()
+    # 1. catheter in place until the period after removal
+    catheter_in = np.concatenate(([True], np.cumsum(removed[:-1]) == 0))
 
-    n = len(patient_cf)
+    # 1b. no removal recorded at all - do not let risk run past the observed
+    # end of catheterisation
+    if removed.sum() == 0:
+        catheter_in = catheter_in & (run_cf["cath_in_observed"].to_numpy() == 1)
 
-    # ------------------------------------------------------------------
-    # 1. Catheter IN or OUT
-    # ------------------------------------------------------------------
-    catheter_in = np.ones(n, dtype=bool)
+    run_cf["catheter_state_cf"] = np.where(catheter_in, "IN", "OUT")
 
-    removal_index_arr = np.where(removed == 1)[0]
+    # 2. elapsed clock across this run
+    t_end = np.cumsum(ih)
+    t_start = t_end - ih
 
-    if len(removal_index_arr) > 0:
-        removal_index = removal_index_arr[0]
-        # the removal row itself still counts as IN (removal happens during
-        # that period); every row after it is OUT
-        catheter_in[removal_index + 1:] = False
-    else:
-        removal_index = None
+    # 3. time the simulated removal completed, carried forward
+    t_removed = pd.Series(np.where(removed == 1, t_end, np.nan)).ffill().to_numpy()
 
-    patient_cf["catheter_state_cf"] = np.where(catheter_in, "IN", "OUT")
+    # 4. hours from removal to the start of each later period
+    hours_since = t_start - t_removed
 
-    # ------------------------------------------------------------------
-    # 2. Hours since removal - a RUNNING TOTAL of interval_hours over the
-    #    OUT rows (the fix for bug 2)
-    # ------------------------------------------------------------------
-    hours_since_removal = np.zeros(n)
+    # 5. out of catheter but still inside the post-removal window
+    in_window = (~catheter_in) & ~np.isnan(hours_since) & (hours_since < window_hours)
 
-    if removal_index is not None:
-        running_total = 0.0
-        for i in range(removal_index + 1, n):
-            running_total += hours[i]
-            hours_since_removal[i] = running_total
+    run_cf["at_risk_cauti_cf"] = (catheter_in | in_window).astype(int)
 
-    # ------------------------------------------------------------------
-    # 3. CAUTI at-risk window: IN, or OUT but still within 48h of removal
-    # ------------------------------------------------------------------
-    at_risk_cf = (
-        catheter_in
-        | ((~catheter_in) & (hours_since_removal <= post_removal_window_hours))
-    )
-    patient_cf["at_risk_cauti_cf"] = at_risk_cf.astype(int)
+    return run_cf
 
-    # ------------------------------------------------------------------
-    # 4. periods_in_state_cf - duration feature fed to the model.
-    #    While IN: period_number (matches predicted_probability_if_in).
-    #    While OUT: a fresh count 1, 2, 3, ... since removal, mirroring how
-    #    the real periods_in_state behaves for real OUT-state rows.
-    # ------------------------------------------------------------------
-    periods_in_state_cf = np.zeros(n, dtype=int)
-    out_count = 0
-    for i in range(n):
-        if catheter_in[i]:
-            periods_in_state_cf[i] = period_number[i]
-        else:
-            out_count += 1
-            periods_in_state_cf[i] = out_count
-    patient_cf["periods_in_state_cf"] = periods_in_state_cf
+# Zero the risk only once outside the post-removal window.
+def predict_counterfactual(run_cf):
 
-    return patient_cf
+
+    probs = run_cf["baseline_probability"].to_numpy().copy()
+    probs[run_cf["at_risk_cauti_cf"].to_numpy() == 0] = 0.0
+    run_cf["predicted_probability"] = probs
+
+    return run_cf
 
 
 # ==============================================================================
 # PART 3 - IMPLEMENT THE G FORMULA AND RESULTS
 # ==============================================================================
 
-# Function to run G formula to get cumulative risk of CAUTI
-def cumulative_risk(patient_cf):
-    p = patient_cf["predicted_probability"].values
+def cumulative_risk(cf):
+    
+    p = cf["predicted_probability"].values
+    
     return 1 - np.prod(1 - p)
 
+patients_runs = []
+ 
+for sid, patient_df in df_sim.groupby("subject_id", sort=False):
+ 
+    runs = [
+        run_df
+        for run_key, run_df in patient_df.groupby(["hadm_id", "stay_id", "cath_run"], sort=False)
+        if run_key[2] >= 1
+    ]
+ 
+    if runs:
+        patients_runs.append(runs)
+
+print("\nPatients with at least one catheter run:", len(patients_runs))
+print("Catheter runs simulated per policy:      ", sum(len(r) for r in patients_runs))
 
 results = []
 
-# evaluate each policy
 for policy_name, policy in POLICIES.items():
 
-    episode_frames = []
+    patient_risks = []
+    at_risk_periods = []
+    run_violations = []
+    natural_agreement = []
 
-    # run simulation separately for each catheter episode - grouping by the
-    # full EPISODE_KEY (not just subject_id) so patients with more than one
-    # catheter episode get a separate, independent simulation per episode
-    for _, episode in df_sim.groupby(EPISODE_KEY):
+    for runs in patients_runs:
 
-        cf = create_counterfactual_patient(episode, policy)
-        cf = update_catheter_state(cf)
-        episode_frames.append(cf)
+        cf_parts = []
 
-    all_cf = pd.concat(episode_frames)
-    all_cf["predicted_probability"] = 0.0
+        # each run gets its own independent removal decision
+        for run_df in runs:
 
-    # IN rows: reuse the precomputed "if still catheterised" probability -
-    # every policy shares the same continuous-catheterisation assumption up
-    # to (and including) the removal row
-    in_mask = all_cf["catheter_state_cf"] == "IN"
-    all_cf.loc[in_mask, "predicted_probability"] = all_cf.loc[in_mask, "predicted_probability_if_in"]
+            cf = create_counterfactual_run(run_df, policy)
+            cf = update_catheter_state(cf, POST_REMOVAL_WINDOW_HOURS)
+            cf = predict_counterfactual(cf)
 
-    # OUT rows still inside the 48h window: these need a FRESH prediction,
-    # because periods_in_state_cf (periods since removal) is policy-specific
-    # (removal timing differs by policy), so it can't be precomputed once
-    window_mask = (all_cf["catheter_state_cf"] == "OUT") & (all_cf["at_risk_cauti_cf"] == 1)
-    window_rows = all_cf.loc[window_mask]
+            cf_parts.append(cf)
+            run_violations.append(int(cf["positivity_violation"].iloc[0]))
 
-    if len(window_rows) > 0:
-        X = window_rows[PREDICTORS_CF].copy()
-        X.columns = PREDICTORS  # rename periods_in_state_cf -> periods_in_state for the model
-        X_imputed = pd.DataFrame(imputer.transform(X), columns=PREDICTORS, index=X.index)
-        probs = calibrated_model.predict_proba(X_imputed)[:, 1]
-        all_cf.loc[window_rows.index, "predicted_probability"] = probs
+            # Validation: under no intervention the reconstructed at-risk flag
+            # should reproduce the panel's own at_risk_cauti.
+            if policy["type"] == "natural":
+                natural_agreement.append(
+                    float((cf["at_risk_cauti_cf"] == cf["at_risk_cauti"]).mean())
+                )
 
-    # rows beyond the 48h window (OUT & at_risk_cauti_cf == 0) stay at 0
+        cf_patient = pd.concat(cf_parts)
+        patient_risks.append(cumulative_risk(cf_patient))
+        at_risk_periods.append(int(cf_patient["at_risk_cauti_cf"].sum()))
 
-    # cumulative risk per episode, then average across all episodes
-    episode_risks = []
-    for _, group in all_cf.groupby(EPISODE_KEY):
-        episode_risks.append(cumulative_risk(group))
+    results.append({
+        "Policy": policy_name,
+        "Mean Risk": np.mean(patient_risks),
+    })
 
-    results.append({"Policy": policy_name, "Mean Risk": np.mean(episode_risks)})
 
-# convert results into dataframe for policy comparison
 policy_results = pd.DataFrame(results)
 policy_results["Mean Risk (%)"] = (policy_results["Mean Risk"] * 100).round(3)
 
-# Get results
-print("\n" + "=" * 70)
-print("G-FORMULA CAUTI POLICY RISK ESTIMATES (cumulative per-episode risk)")
-print("=" * 70)
-print(policy_results.to_string(index=False))
+print("\n" + "=" * 90)
+print("G-FORMULA CAUTI POLICY RISK ESTIMATES (cumulative per-patient risk)")
+
+print("=" * 90)
+print(policy_results[["Policy", "Mean Risk (%)"]].to_string(index=False))
