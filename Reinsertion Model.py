@@ -12,6 +12,7 @@ REINSERTION PROBABILITY MODEL + G-FORMULA SIMULATION
 import pandas as pd
 import numpy as np
 import joblib
+import matplotlib.pyplot as plt
 
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.impute import SimpleImputer
@@ -24,13 +25,11 @@ from sklearn.calibration import calibration_curve, CalibratedClassifierCV
 # PART 1 - BUILD THE REINSERTION PROBABILITY MODEL
 # ==============================================================================
 
-# Target only makes sense on rows where at_risk_reinsertion == 1
-# (catheter currently out, patient could still get one reinserted)
+# Target rows where at_risk_reinsertion == 1
+
 TARGET = "reinsertion_in_period"
 
-# Predictor list - no periods_in_state or interval_hours here, since
-# those get recomputed per-policy under the counterfactual timeline
-# later (see periods_in_state_cf), rather than being fixed columns
+# Predictor list 
 PREDICTORS = [
     "age",
     "sex_M",
@@ -67,8 +66,7 @@ PREDICTORS = [
     "itemid_220050__mean",
 ]
 
-# IDs and flags I need on top of the predictors - to define risk sets,
-# split train/test, and identify episodes later
+# IDs and flags needed for risk sets, splits, and episode grouping
 EXTRA_COLS = [
     "subject_id",
     "hadm_id",
@@ -90,7 +88,7 @@ print("Loading data...")
 df_full = pd.read_csv("Dataset.csv", usecols=all_columns_needed)
 print("Data loaded. Shape:", df_full.shape)
 
-# Sanity check before doing anything else 
+# Fail early if any expected column is absent
 missing_cols = [c for c in all_columns_needed if c not in df_full.columns]
 if len(missing_cols) > 0:
     raise ValueError("These columns are missing from the dataset:", missing_cols)
@@ -99,7 +97,7 @@ print("All expected columns are present.")
 # Key that uniquely identifies one catheter episode
 EPISODE_KEY = ["subject_id", "hadm_id", "stay_id", "episode_index"]
 
-# Always sort into chronological order per episode
+# Sort into chronological order per episode
 df_full = df_full.sort_values(
     EPISODE_KEY + ["periods_in_state"]
 ).reset_index(drop=True)
@@ -122,10 +120,38 @@ X_test = df_test[PREDICTORS]
 y_test = df_test[TARGET]
 
 # Group by subject for GroupKFold
-groups = df_train["subject_id"]
+groups = df_train["subject_id"] # Prevents subject-level leakage
 
 baseline_rate = y_test.mean()
 print("\nbaseline rate:", round(baseline_rate, 4))
+
+# Check missingness
+missing = (
+    df_full[PREDICTORS]
+    .isnull()
+    .mean()
+    .mul(100)
+    .sort_values(ascending=False)
+)
+
+missing_table = pd.DataFrame({
+    "Missing_Percentage": missing
+})
+
+print("\n" + "=" * 55)
+print("MISSING DATA SUMMARY (MODEL PREDICTORS)")
+print("=" * 55)
+print(missing_table)
+
+plt.figure(figsize=(14, 8))
+missing.plot(kind="bar")
+
+plt.title("Missing Data Percentage for Model Predictor Variables")
+plt.xlabel("Predictor")
+plt.ylabel("% Missing")
+plt.xticks(rotation=90)
+plt.tight_layout()
+plt.show()
 
 # Median imputation, fit on train only
 imputer = SimpleImputer(strategy="median")
@@ -149,7 +175,11 @@ group_kfold = GroupKFold(n_splits=5)
 
 # Cross-validate with all 3 metrics
 cv_results = cross_validate(
-    pipeline, X_train, y_train, cv=group_kfold, groups=groups,
+    pipeline, 
+    X_train, 
+    y_train, 
+    cv=group_kfold, 
+    groups=groups,
     scoring=["roc_auc", "average_precision", "neg_brier_score"]
 )
 
@@ -226,7 +256,7 @@ cauti_model = joblib.load("model_cauti.pkl")
 # PART 2 - BUILD G FORMULA DATASET AND COUNTERFACTUAL TRAJECTORIES
 # ==============================================================================
 
-# Simulation dataset, test split, sorted chronologically per episode
+# Simulation on the test split only 
 df_sim = df_full[df_full["split"] == "test"].copy()
 df_sim = df_sim.sort_values(
     EPISODE_KEY + ["periods_in_state"]
@@ -239,15 +269,14 @@ print("Episodes:", df_sim.groupby(EPISODE_KEY).ngroups)
 df_sim_atrisk = df_sim[df_sim["at_risk_reinsertion"] == 1].copy()
 print("At-risk rows available for policy simulation:", len(df_sim_atrisk))
 
-# Swap periods_in_state for periods_in_state_cf in the column list
+# Counterfactual predictor list swaps in the simulated time-in-state
 PREDICTORS_CF = [
     "periods_in_state_cf" if col == "periods_in_state" else col
     for col in PREDICTORS
 ]
 
 
-# Precompute predicted CAUTI probability for every row 
-
+# Score CAUTI risk once upfront for every at-risk row
 cauti_scored_mask = df_sim["at_risk_cauti"] == 1
 X_cauti = pd.DataFrame(
     cauti_imputer.transform(df_sim.loc[cauti_scored_mask, CAUTI_PREDICTORS]),
@@ -276,24 +305,23 @@ STABILITY_THRESHOLDS = {
 
 # All the policies being compared.
 POLICIES = {
+    # Clinical practice 
     "Observed Practice": {"type": "natural"},
-
+    # Fixed day removals
     "Remove day 1": {"type": "day", "day": 1},
     "Remove day 2": {"type": "day", "day": 2},
     "Remove day 3": {"type": "day", "day": 3},
     "Remove day 4": {"type": "day", "day": 4},
     "Remove day 5": {"type": "day", "day": 5},
     "Remove day 6": {"type": "day", "day": 6},
-
+    # Stability removals
     "Clinical stability": {"type": "stability"},
     "Clinical stability (>= Day 3)": {"type": "stability_min_day", "min_day": 3},
-
+    # Hybrid Policies 
     "Hybrid (stability OR day 4 cap)": {"type": "hybrid", "day_cap": 4},
     "Hybrid (stability OR day 5 cap)": {"type": "hybrid", "day_cap": 5},
     "Hybrid (stability OR day 6 cap)": {"type": "hybrid", "day_cap": 6},
-
     # Remove as soon as predicted CAUTI risk reaches X% — reinsertion
-    # risk is then measured as the DOWNSTREAM CONSEQUENCE of that choice.
     "Remove when CAUTI risk >= 1%": {"type": "cauti_risk_threshold", "threshold": 0.01},
     "Remove when CAUTI risk >= 2%": {"type": "cauti_risk_threshold", "threshold": 0.02},
     "Remove when CAUTI risk >= 5%": {"type": "cauti_risk_threshold", "threshold": 0.05},
@@ -304,13 +332,7 @@ POLICIES = {
 
 
 def create_counterfactual_patient(episode_rows, policy):
-    # episode_rows arrives already in the correct chronological order:
-    # df_sim was sorted by EPISODE_KEY + periods_in_state earlier, and
-    # groupby() preserves that row order within each group. Re-sorting by
-    # interval_hours here was a bug - interval_hours is a DURATION (hours
-    # until the next observation), not a timestamp, so two periods with
-    # the same interval_hours value could get shuffled into the wrong
-    # order. Just take the rows as they arrive and reset removed_in_period.
+
     patient_cf = episode_rows.copy()
     ptype = policy["type"]
 
@@ -415,10 +437,7 @@ for policy_name, policy in POLICIES.items():
 
     episode_frames = []
 
-    # Build the counterfactual trajectory for every episode under this
-    # policy. Grouping by the full EPISODE_KEY (not just subject_id) so
-    # patients with more than one catheter episode get a separate,
-    # independent simulation restarted for each episode.
+    # Build the counterfactual trajectory for every episode 
     for key, episode in df_sim.groupby(EPISODE_KEY):
         cf = create_counterfactual_patient(episode, policy)
 
